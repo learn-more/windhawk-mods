@@ -2,7 +2,7 @@
 // @id           lm-vs-solution-icon
 // @name         Visual Studio Solution Icon
 // @description  Add an icon overlay on the Visual Studio task bar icon
-// @version      0.7
+// @version      0.8
 // @author       Mark Jansen
 // @github       https://github.com/learn-more
 // @twitter      https://twitter.com/learn_more
@@ -24,10 +24,13 @@ Tested on:
 - Visual Studio 2017
 - Visual Studio 2019
 - Visual Studio 2022
+- Visual Studio 2026
 
 Inspired by [SolutionIcon](https://github.com/ashmind/SolutionIcon/blob/master/SolutionIcon/Implementation/IconGenerator.cs)
 
 ## Releases:
+- 0.8:
+  - Reload the icon after VS clears it (eg. for update icon)
 - 0.7:
   - Try to use/load .editoricon.ico
 - 0.6:
@@ -52,6 +55,7 @@ UINT g_taskbarCreatedMsg = RegisterWindowMessage(L"TaskbarCreated");
 
 constexpr int kImageWidth = 16;
 constexpr int kImageHeight = 16;
+constexpr int kSetOverlayIconVtblIndex = 18;
 
 struct SET_WINDOW_SUBCLASS_FROM_ANY_THREAD_PARAM {
   SUBCLASSPROC pfnSubclass;
@@ -133,6 +137,8 @@ void UnsubclassVSWindow(HWND hWnd) {
 
 HRESULT g_CoInit = E_FAIL;
 ITaskbarList3* g_TaskbarList3 = nullptr;
+static thread_local bool g_settingSolutionOverlayIcon = false;
+static bool g_uninitializing = false;
 
 struct Utils
 {
@@ -179,16 +185,18 @@ static void ApplyIcon(const std::wstring& commandline)
             }
         }
 
-        // Did we find something to show as icon?
-        if (icon == NULL)
+        HWND mainWindow = Utils::MainWindow();
+        if (mainWindow)
         {
-            g_TaskbarList3->SetOverlayIcon(Utils::MainWindow(), NULL, NULL);
+            // VS temporarily owns the overlay for update notifications. When it
+            // clears that overlay, our SetOverlayIcon hook restores this one.
+            g_settingSolutionOverlayIcon = true;
+            g_TaskbarList3->SetOverlayIcon(mainWindow, icon, NULL);
+            g_settingSolutionOverlayIcon = false;
         }
-        else
-        {
-            g_TaskbarList3->SetOverlayIcon(Utils::MainWindow(), icon, NULL);
+
+        if (icon)
             ::DestroyIcon(icon);
-        }
     }
 }
 
@@ -210,8 +218,25 @@ static void ApplyIconAfterReload()
 }
 
 typedef decltype(&RegisterApplicationRestart) REGISTERAPPLICATIONRESTART;
+typedef HRESULT (STDMETHODCALLTYPE* SETOVERLAYICON)(ITaskbarList3* self, HWND hwnd, HICON hIcon, LPCWSTR pszDescription);
 
 REGISTERAPPLICATIONRESTART oRegisterApplicationRestart;
+SETOVERLAYICON oSetOverlayIcon;
+
+HRESULT STDMETHODCALLTYPE hkSetOverlayIcon(ITaskbarList3* self, HWND hwnd, HICON hIcon, LPCWSTR pszDescription)
+{
+    HRESULT hr = oSetOverlayIcon(self, hwnd, hIcon, pszDescription);
+
+    if (SUCCEEDED(hr) && !g_settingSolutionOverlayIcon && !g_uninitializing &&
+        hIcon == NULL && hwnd == Utils::MainWindow())
+    {
+        Wh_Log("External SetOverlayIcon clear; restoring solution overlay");
+        ApplyIconAfterReload();
+    }
+
+    return hr;
+}
+
 HRESULT WINAPI hkRegisterApplicationRestart(PCWSTR pwzCommandline, DWORD dwFlags)
 {
     if (pwzCommandline)
@@ -241,6 +266,9 @@ BOOL Wh_ModInit(void)
     }
     g_TaskbarList3->HrInit();
 
+    void** taskbarList3Vtbl = *(void***)g_TaskbarList3;
+    Wh_SetFunctionHook(taskbarList3Vtbl[kSetOverlayIconVtblIndex], (void*)hkSetOverlayIcon, (void**)&oSetOverlayIcon);
+
     Wh_SetFunctionHook((void*)::RegisterApplicationRestart, (void*)hkRegisterApplicationRestart, (void**)&oRegisterApplicationRestart);
 
     return TRUE;
@@ -255,12 +283,15 @@ void Wh_ModAfterInit(void)
 void Wh_ModUninit(void)
 {
     Wh_Log(L"Uninit");
+    g_uninitializing = true;
 
     UnsubclassVSWindow(Utils::MainWindow());
 
     if (g_TaskbarList3)
     {
-        g_TaskbarList3->SetOverlayIcon(Utils::MainWindow(), NULL, NULL);
+        HWND mainWindow = Utils::MainWindow();
+        if (mainWindow)
+            g_TaskbarList3->SetOverlayIcon(mainWindow, NULL, NULL);
         g_TaskbarList3->Release();
     }
     g_TaskbarList3 = nullptr;
